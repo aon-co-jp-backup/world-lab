@@ -27,9 +27,17 @@ world-lab/
 ├── README-English.md  # 英語 / English
 ├── CLAUDE.md           # 開発方針・エコシステム内の位置づけ・HANDOFF
 ├── PORTING.md          # 本ファイル / this file
-└── docs/
-    └── world-laboratory-design.md  # アーキテクチャ設計(2026-08-06に
-                                      # dream-osから移設)
+├── Cargo.toml           # ワークスペース定義(2026-08-06新設)
+├── docs/
+│   └── world-laboratory-design.md  # アーキテクチャ設計(2026-08-06に
+│                                     # dream-osから移設)
+└── crates/
+    └── world-lab-coordinator/  # コーディネータ本体(Rust+tokio/hyper
+        │                        # 直接実装、Poem非依存)
+        ├── Cargo.toml           # ../../../dream-os/crates/dream-os-wire
+        │                        # へのpath依存
+        ├── src/main.rs
+        └── examples/submit_worker_result.rs
 ```
 
 ## 2. VPS/ローカルとの対応 / Local & VPS locations
@@ -41,14 +49,20 @@ world-lab/
 
 ## 3. `dream-os`との依存関係 / Dependency on `dream-os`
 
-コーディネータ実装が始まった際、`dream-os-kernel`/`dream-os-wire`への
-依存方法(path依存 vs. ネットワーク越しの利用)を確定させる必要が
-あります。移設する場合は`dream-os`(`../dream-os`、同じ`F:\runo`直下に
-cloneされている前提)も同じ相対位置関係でcloneしておくことを推奨します
-(実際の依存方式が確定次第、このセクションを更新すること)。
+`crates/world-lab-coordinator`は`dream-os-wire`
+(`../../../dream-os/crates/dream-os-wire`)へのpath依存を持つ
+(`WorkerChannel`/`CoordinatorChannel`/`AruaruDbStore`を再利用)。
+さらに`dream-os-wire`自体が`open-web-server-wire`
+(`../../../open-web-server/crates/open-web-server-wire`)・
+`aruaru-db`への実行時ネットワーク接続(`WORLD_LAB_ARUARU_PG_CONN`環境
+変数、pgwire)を持つ。移設する場合は`dream-os`・`open-web-server`・
+`RS-SmartTCP`を同じ相対位置関係でcloneしておくこと。
 
-When coordinator work begins, decide how it depends on `dream-os-kernel`/
-`dream-os-wire` (path dependency vs. network client). Until then, keep
-`dream-os` (`../dream-os`) cloned at the same relative position when
-relocating this repo (update this section once the actual dependency
-mechanism is settled).
+`crates/world-lab-coordinator`has a path dependency on `dream-os-wire`
+(`../../../dream-os/crates/dream-os-wire`, reusing `WorkerChannel`/
+`CoordinatorChannel`/`AruaruDbStore`). `dream-os-wire` itself has a path
+dependency on `open-web-server-wire`
+(`../../../open-web-server/crates/open-web-server-wire`) and a runtime
+network dependency on `aruaru-db` (via the `WORLD_LAB_ARUARU_PG_CONN`
+env var, pgwire). When relocating, keep `dream-os`, `open-web-server`,
+and `RS-SmartTCP` cloned at the same relative positions.

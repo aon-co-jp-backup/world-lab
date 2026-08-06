@@ -42,10 +42,16 @@ for the full architecture (a 4-layer design, research into precedents
 like BOINC, work-unit design, N-of-M majority-vote verification, Sybil
 resistance challenges, and a phased roadmap).
 
-## Current status
+## Current status (2026-08-06, coordinator implemented and verified on real hardware)
 
-Concept/design stage only — no coordinator implementation or work-unit
-distribution logic yet (see the HANDOFF section of
+`crates/world-lab-coordinator` (Rust + tokio/hyper directly, no Poem
+dependency) provides the work-unit distribution / result-submission HTTP
+API. It actually uses `dream-os-wire`'s `WorkerChannel`/
+`CoordinatorChannel` (AEAD encryption + replay protection), and normal
+result submission plus **replay-attack rejection** have been verified
+end-to-end with real processes, real HTTP, and real cryptography. N-of-M
+majority-vote verification, work-unit persistence, and per-worker key
+distribution are not yet implemented (see the HANDOFF section of
 [`CLAUDE.md`](CLAUDE.md) for details).
 
 ## Related projects

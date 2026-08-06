@@ -37,10 +37,14 @@
 参照してください(4層構成、BOINC等の先行事例調査、ワークユニット設計、
 N-of-M多数決検証、Sybil耐性の課題、段階的ロードマップ)。
 
-## 現状
+## 現状(2026-08-06、コーディネータ本体を実機検証済み)
 
-構想・設計文書のみの段階です。コーディネータ本体・ワークユニット配布
-ロジックの実装はまだありません(詳細は[`CLAUDE.md`](CLAUDE.md)の
+`crates/world-lab-coordinator`(Rust+tokio/hyper直接実装、Poem非依存)が
+ワークユニット配布・結果受信のHTTP APIを提供します。`dream-os-wire`の
+`WorkerChannel`/`CoordinatorChannel`(AEAD暗号化+リプレイ対策)を実際に
+使い、正常な結果送信・**リプレイ攻撃の拒否**を実プロセス・実HTTP・実暗号
+処理で検証済みです。N-of-M多数決検証・ワークユニットの永続化・
+ワーカーごとの鍵配布は未実装(詳細は[`CLAUDE.md`](CLAUDE.md)の
 HANDOFF参照)。
 
 ## 関連プロジェクト

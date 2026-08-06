@@ -52,14 +52,62 @@ Windows/Android共通実行基盤PoC)のサブ構想として設計・実装が�
 [`docs/world-laboratory-design.md`](docs/world-laboratory-design.md)
 (`dream-os`から2026-08-06に移設)を参照。
 
-## 現状(2026-08-06、リポジトリ分離直後)
+## 現状(2026-08-06、コーディネータ本体を実装・実機検証済み)
 
-構想・設計文書のみ移設した段階。コーディネータ本体・ワークユニット
-配布ロジックの実装はまだ無い(`dream-os`側の`dream-os-wire`/
-`dream-os-kernel`が提供する部品を、このリポジトリからどう呼び出すか
-〈path依存/HTTPクライアント等〉は次回設計)。
+**`crates/world-lab-coordinator`(新規)**: Rust+tokio/hyper直接実装
+(Poem非依存、`open-web-server-gateway`と同じ`accept_loop`+
+`service_fn`+`http1::Builder`パターンを踏襲、ただしRPoem/open-web-server
+自体のクレートには依存せず独立実装)のHTTPサーバー。
+
+**実装したAPI(フェーズ1)**:
+- `GET /health` — 死活確認。
+- `POST /work-units` — ワークユニット登録(テスト/管理用途)。
+- `GET /work-units/next` — 未着手ワークユニットを1件取得(FIFO)。
+- `POST /work-units/:id/submit?worker_id=X` — ワーカーが`dream-os-wire::
+  WorkerChannel`で暗号化した結果フレームを送信、コーディネータが
+  `CoordinatorChannel`で復号・改ざん検知・リプレイ拒否した上で
+  `aruaru-db`(設定時)へ永続化。
+
+**実機検証(実プロセス3つ・実HTTP・実暗号処理)**: コーディネータを実際に
+起動し、`examples/submit_worker_result.rs`(実ワーカー役、
+`dream_os_wire::WorkerChannel`で実際にAEAD暗号化)から実HTTP POSTで結果を
+送信。以下を実証:
+1. 正常な結果送信が受理されること(`{"accepted":true,...}`)。
+2. **同一暗号化フレームを2回目に送信するとリプレイとして拒否される**
+   こと(`{"error":"rejected: failed to decrypt/verify work result
+   frame"}`)——ワーカーごとの`CoordinatorChannel`が複数HTTPリクエストに
+   またがって正しく状態(既知シーケンス番号集合)を保持している直接証拠。
+
+**実装過程で発見・修正した実際の設計上の罠**: 当初`CoordinatorChannel::
+new()`をリクエストのたびに新規生成する実装にしていたが、
+`SecureChannel`のリプレイガードは呼び出し元インスタンスの内部状態
+(既知シーケンス番号集合)に依存するため、これでは`seen`集合が毎回
+空になりリプレイ検知が機能しない実バグになることに気付いた——
+ワーカーIDごとに1つの`CoordinatorChannel`を`AppState`内で保持し続ける
+設計へ修正した(詳細は`main.rs`のコメント参照)。
+
+**正直な開示・スコープの限界**: (1) 鍵共有は全ワーカー共通の開発用
+固定鍵(フェーズ1の簡略化、フェーズ3で認証・鍵配布基盤が必要)、
+(2) N-of-M多数決検証は未実装(フェーズ2)、(3) ワークユニットの永続化は
+現状プロセス内メモリのみ(再起動で失われる)、(4) `aruaru-db`永続化は
+実接続確認済み(`WORLD_LAB_ARUARU_PG_CONN`設定時)だが、今回の実機検証
+では未設定のまま実施(`aruaru_commit_id: null`)——別途`dream-os`側で
+`aruaru-db`永続化自体は実機検証済み。
 
 ## HANDOFF(直近の作業ログ、上が最新)
+
+- **2026-08-06(続き) コーディネータ本体(`world-lab-coordinator`)を実装・
+  実機検証**: ユーザー指示「open-directx優先で同時進行で、world-lab側の
+  コーディネータ本体(RPoem/open-web-server上へのHTTP API実装)を進めて」
+  への対応。詳細は上記「現状」節参照。`dream-os-wire`(`WorkerChannel`/
+  `CoordinatorChannel`/`AruaruDbStore`)へのpath依存で実装、実プロセス・
+  実HTTP・実AEAD暗号処理で正常送信・リプレイ拒否を実証。open-directx側は
+  並行してバックグラウンドエージェントが境界チェック付きチェーンを
+  3項→4項へ拡張・実機検証済み(`cf95ba2`)。
+  - 次にすべきこと: (1) `POST /work-units`の自動分割ロジック(現状は
+    手動登録のみ)、(2) N-of-M多数決検証の実装(フェーズ2)、(3) ワーク
+    ユニットの永続化(現状プロセス内メモリのみ)、(4) ワーカーごとの
+    鍵配布(フェーズ3、KeyGuardian等の活用検討)。
 
 - **2026-08-06 新規作成・リポジトリ分離**: ユーザー指示「ワールド
   ラボラトリー構想のリポジトリ名はworld-labとして作成して、VPSと
