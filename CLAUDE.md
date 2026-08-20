@@ -123,6 +123,77 @@ new()`をリクエストのたびに新規生成する実装にしていたが�
 
 ## HANDOFF(直近の作業ログ、上が最新)
 
+- **2026-08-20 ワークユニットの永続化を実装・実機検証(前回HANDOFFの
+  「(3) ワークユニットの永続化」に対応)**:
+  1. **実装内容**: `dream-os-wire::aruaru_persistence::AruaruDbStore`
+     (既存の`world_lab_results`永続化と同じ接続・同じ設計パターン)へ、
+     `ensure_work_units_schema`/`insert_work_unit`/
+     `update_work_unit_claimed`/`load_all_work_units`を追加。
+     `world_lab_work_units`テーブル(`id`/`payload_b64`/`claimed`)に、
+     ワークユニットのpayloadをBase64エンコードして保存する
+     (`aruaru-query`のSQLパーサーがVALUES内のカンマを単純split()する
+     制約への回避策、既存の`persist_result`と同じ理由・同じ手法)。
+     `claimed`はbool型ではなく`'true'`/`'false'`の文字列——
+     `aruaru-query`のUPDATE文パーサーが`SET col = 'v' WHERE col2 =
+     'v2'`という単一の等価条件のみサポートするための制約。
+     `world-lab-coordinator/src/main.rs`は起動時、
+     `WORLD_LAB_ARUARU_PG_CONN`が設定されていれば`load_all_work_units`
+     で全件読み出し、`AppState`(`work_units`/`queue`/`next_id`)を復元。
+     `POST /work-units`(新規登録)・`GET /work-units/next`(claim)の
+     両方でDBへの書き込みも行うようにした。未設定時は従来通りプロセス
+     内メモリのみ(後方互換)。
+  2. **正直な開示・スコープの限界**: (a) ワークユニットの状態は
+     「未着手→claimed(取得済み)」の1方向フラグのみで、`submit`後の
+     「完了」は`work_units`テーブル側には反映されない(結果自体は
+     既存の`world_lab_results`テーブルへ別途保存される)——3値ステータス
+     (未着手/進行中/完了)のうち「進行中」と「完了」は現状区別されない。
+     (b) 復元時、`claimed=true`のワークユニットはFIFOキューへ戻さない
+     (再起動を跨いだ再配布はしない、安全側の判断——(a)の制約により
+     「進行中で失敗したまま」なのか「既に完了済み」なのか区別できない
+     ため)。(c) 全件を1回のSELECTで読み込む単純な実装で、大量の
+     ワークユニットに対するページング等は無い。
+  3. **実機検証(実DB、型チェックのみで完了と報告しない方針を徹底)**:
+     `cargo build --release -p world-lab-coordinator`成功。実際に
+     `aruaru-server.exe`(`F:\runo\aruaru-db\target\release`の既存
+     ビルド済みバイナリ、`ARUARU_USERS=dreamos:devpass`でSCRAM認証を
+     有効化)をローカルで起動し、`WORLD_LAB_ARUARU_PG_CONN`(パスワード
+     込みの接続文字列)を設定した`world-lab-coordinator`を起動→
+     `POST /work-units`で`wu-000001`を登録→**コーディネータプロセスを
+     完全終了(`Stop-Process`)→再起動**→`GET /work-units/next`が
+     `{"id":"wu-000001","payload":{"task":"e2e-persist-test"},
+     "claimed":true}`を実際に返し、再起動を跨いでワークユニットの登録
+     内容が復元されていることを実HTTPリクエストで確認した。
+  4. **検証過程で発見したaruaru-server側の実際の罠(正直な開示、本
+     リポジトリのコードは修正不要だったが記録)**: (a)
+     `aruaru_persistence.rs`のモジュールdocが「`aruaru-server`は既定で
+     認証を要求しない開発用構成」と記載していたが、実際に接続を試みた
+     ところ`aruaru-wire`側は常にSCRAM-SHA-256認証ハンドラ
+     (`AruaruStartupHandler`)を使う実装になっており、`ARUARU_USERS`
+     環境変数が未設定でも「認証不要」にはならず「登録ユーザー0件で
+     全ログイン拒否」になる(`auth.rs`の`from_env`実装を確認して判明)
+     ——上記docコメントの記載は現行の`aruaru-server`の挙動と一致して
+     いなかった(本リポジトリ側のコード変更は行っていない、記述の
+     食い違いの指摘のみ)。(b) 検証中、ポート5432に**2つの
+     `aruaru-server`プロセスが同時にlisten**していた状態(`0.0.0.0:5432`
+     と`127.0.0.1:5432`、前回セッションの残留プロセス)に気付かず、
+     新しい`ARUARU_USERS`設定が反映されない古いプロセスへ接続して
+     しまい「password authentication failed」で一時的にハマった——
+     `netstat`で2つのLISTENERを発見し古い方を`taskkill`してから正しく
+     検証できた(実機検証時の見落としやすい罠として記録)。
+  5. **クリーンアップ**: 検証で使った一時DB(`%TEMP%\wl_e2e_*`等)・
+     起動していた`aruaru-server.exe`/`world-lab-coordinator.exe`
+     プロセスはすべて終了・削除済み。デバッグ用に一時追加した
+     `dream-os-wire/tests/work_unit_persistence_debug.rs`は検証後に
+     削除済み(本コミットには含まれない)。
+  - 次にすべきこと: (1) ワークユニットの3値ステータス(未着手/進行中/
+    完了)への拡張(現状は未着手/claimedの2値のみ)、(2)
+    N-of-M多数決検証の実装(フェーズ2、変更なし)、(3) ワーカーごとの
+    鍵配布(フェーズ3、変更なし)、(4)
+    `aruaru_persistence.rs`のモジュールdocにある「既定で認証を要求
+    しない」という記述を、`aruaru-db`側の実際の挙動(常時SCRAM認証)に
+    合わせて修正することを`dream-os`側のセッションで検討する
+    (本リポジトリの管轄外、参考情報として記録)。
+
 - **2026-08-06(続き) コーディネータ本体(`world-lab-coordinator`)を実装・
   実機検証**: ユーザー指示「open-directx優先で同時進行で、world-lab側の
   コーディネータ本体(RPoem/open-web-server上へのHTTP API実装)を進めて」

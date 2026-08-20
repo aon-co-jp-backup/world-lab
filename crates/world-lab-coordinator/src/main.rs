@@ -38,7 +38,29 @@
 //!   簡略化であることを明記する。
 //! - **N-of-M多数決検証は未実装**: 現状は1件の結果をそのまま受理する
 //!   (§3.3のN-of-M複製配布検証はフェーズ2)。
-//! - **ワークユニットの永続化は現状プロセス内メモリのみ**(再起動で失われる)。
+//! - **ワークユニットの永続化(2026-08-20実装)**: `WORLD_LAB_ARUARU_PG_CONN`
+//!   環境変数が設定されている場合、`dream_os_wire::AruaruDbStore`
+//!   (既存の`aruaru_persistence`モジュール、`world_lab_results`テーブルと
+//!   同じ接続を再利用)経由で`world_lab_work_units`テーブルへ
+//!   ワークユニットの登録内容・claimedフラグを永続化する。起動時に
+//!   このテーブルから全件読み出して`AppState`(`work_units`/`queue`/
+//!   `next_id`)を復元するため、コーディネータを再起動してもワーク
+//!   ユニットの状態(未着手/進行中)が失われない。未設定時は従来通り
+//!   プロセス内メモリのみで動作する(後方互換、開発・テスト用途)。
+//!   **正直な開示**: (1) `claimed`は「未着手→取得済み」の1方向の
+//!   フラグのみで、`submit`後の「完了」状態は`work_units`テーブルには
+//!   反映されない(結果自体は既存の`world_lab_results`テーブルへ
+//!   別途永続化される、`handle_submit_result`参照)——ワークユニットの
+//!   3値ステータス(未着手/進行中/完了)のうち「進行中」と「完了」は
+//!   現状どちらも`claimed=true`のまま区別されない、これは今回の
+//!   スコープでは対応していない今後の拡張余地。(2) `aruaru-query`の
+//!   SQLパーサーが`UPDATE ... SET col = 'v' WHERE col2 = 'v2'`という
+//!   単一の等価条件しかサポートしないため、`claimed`はbool型ではなく
+//!   `'true'`/`'false'`の文字列として保存している(`aruaru_persistence`
+//!   モジュール側の制約、詳細はそちらのdoc参照)。(3) 起動時の復元は
+//!   `AruaruDbStore::load_all_work_units`で全件を1回のSELECTで読み出す
+//!   単純な実装であり、ワークユニット数が非常に多い場合のページング等は
+//!   実装していない。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -94,24 +116,60 @@ async fn main() -> Result<()> {
         Ok(conn_str) => match AruaruDbStore::connect(&conn_str).await {
             Ok(store) => {
                 store.ensure_schema().await?;
-                tracing::info!("connected to aruaru-db for result persistence");
+                store.ensure_work_units_schema().await?;
+                tracing::info!("connected to aruaru-db for result and work-unit persistence");
                 Some(store)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to connect to aruaru-db; results will only be kept in memory");
+                tracing::warn!(error = %e, "failed to connect to aruaru-db; work units and results will only be kept in memory");
                 None
             }
         },
         Err(_) => {
-            tracing::warn!("WORLD_LAB_ARUARU_PG_CONN not set; results will only be kept in memory");
+            tracing::warn!("WORLD_LAB_ARUARU_PG_CONN not set; work units and results will only be kept in memory");
             None
         }
     };
 
+    // 永続化先が設定されていれば、起動時に既存のワークユニット状態を
+    // 読み込んで`AppState`を復元する(未着手のワークユニットのみFIFO
+    // キューへ積み戻す、`claimed=true`のものはキューへは戻さない
+    // ——モジュールdocの通り「進行中」と「完了」を区別できない現状の
+    // 制約から、再起動を跨いだ再配布はしない安全側の判断)。
+    let mut restored_work_units: HashMap<String, WorkUnit> = HashMap::new();
+    let mut restored_queue: Vec<String> = Vec::new();
+    let mut restored_next_id: u64 = 0;
+    if let Some(store) = &aruaru {
+        match store.load_all_work_units().await {
+            Ok(mut rows) => {
+                rows.sort_by(|a, b| a.0.cmp(&b.0));
+                for (id, payload, claimed) in rows {
+                    if let Some(n_str) = id.strip_prefix("wu-") {
+                        if let Ok(n) = n_str.parse::<u64>() {
+                            restored_next_id = restored_next_id.max(n);
+                        }
+                    }
+                    if !claimed {
+                        restored_queue.push(id.clone());
+                    }
+                    restored_work_units.insert(id.clone(), WorkUnit { id, payload, claimed });
+                }
+                tracing::info!(
+                    restored_count = restored_work_units.len(),
+                    queued_count = restored_queue.len(),
+                    "restored work units from aruaru-db on startup"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to restore work units from aruaru-db; starting with an empty state");
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
-        work_units: RwLock::new(HashMap::new()),
-        queue: Mutex::new(Vec::new()),
-        next_id: Mutex::new(0),
+        work_units: RwLock::new(restored_work_units),
+        queue: Mutex::new(restored_queue),
+        next_id: Mutex::new(restored_next_id),
         shared_key,
         channels: Mutex::new(HashMap::new()),
         aruaru,
@@ -153,7 +211,7 @@ async fn route(state: Arc<AppState>, req: Request<Incoming>) -> Result<Response<
     let response = match (method.clone(), path.as_str()) {
         (Method::GET, "/health") => json_response(StatusCode::OK, &serde_json::json!({"status": "ok"})),
         (Method::POST, "/work-units") => handle_create_work_unit(&state, req).await,
-        (Method::GET, "/work-units/next") => handle_next_work_unit(&state),
+        (Method::GET, "/work-units/next") => handle_next_work_unit(&state).await,
         (Method::POST, p) if p.starts_with("/work-units/") && p.ends_with("/submit") => {
             let id = p.trim_start_matches("/work-units/").trim_end_matches("/submit").to_string();
             handle_submit_result(&state, req, &id, &query).await
@@ -179,29 +237,51 @@ async fn handle_create_work_unit(state: &Arc<AppState>, req: Request<Incoming>) 
         *n += 1;
         format!("wu-{n:06}")
     };
-    let unit = WorkUnit { id: id.clone(), payload, claimed: false };
+    let unit = WorkUnit { id: id.clone(), payload: payload.clone(), claimed: false };
     state.work_units.write().insert(id.clone(), unit);
     state.queue.lock().push(id.clone());
+
+    if let Some(store) = &state.aruaru {
+        if let Err(e) = store.insert_work_unit(&id, &payload, false).await {
+            tracing::error!(work_unit_id = %id, error = %e, "failed to persist new work unit into aruaru-db (kept in memory only)");
+        }
+    }
 
     json_response(StatusCode::CREATED, &serde_json::json!({"work_unit_id": id}))
 }
 
-fn handle_next_work_unit(state: &Arc<AppState>) -> Response<Full<Bytes>> {
-    let mut queue = state.queue.lock();
-    while let Some(id) = queue.first().cloned() {
-        let mut units = state.work_units.write();
-        if let Some(unit) = units.get_mut(&id) {
-            if !unit.claimed {
-                unit.claimed = true;
-                let unit = unit.clone();
-                drop(units);
-                queue.remove(0);
-                return json_response(StatusCode::OK, &unit);
+async fn handle_next_work_unit(state: &Arc<AppState>) -> Response<Full<Bytes>> {
+    let claimed_id = {
+        let mut queue = state.queue.lock();
+        let mut result = None;
+        while let Some(id) = queue.first().cloned() {
+            let mut units = state.work_units.write();
+            if let Some(unit) = units.get_mut(&id) {
+                if !unit.claimed {
+                    unit.claimed = true;
+                    let unit = unit.clone();
+                    drop(units);
+                    queue.remove(0);
+                    result = Some(unit);
+                    break;
+                }
             }
+            queue.remove(0);
         }
-        queue.remove(0);
+        result
+    };
+
+    match claimed_id {
+        Some(unit) => {
+            if let Some(store) = &state.aruaru {
+                if let Err(e) = store.update_work_unit_claimed(&unit.id, true).await {
+                    tracing::error!(work_unit_id = %unit.id, error = %e, "failed to persist claimed flag into aruaru-db (kept in memory only)");
+                }
+            }
+            json_response(StatusCode::OK, &unit)
+        }
+        None => json_response(StatusCode::NO_CONTENT, &serde_json::json!({"message": "no work units available"})),
     }
-    json_response(StatusCode::NO_CONTENT, &serde_json::json!({"message": "no work units available"}))
 }
 
 async fn handle_submit_result(state: &Arc<AppState>, req: Request<Incoming>, work_unit_id: &str, query: &str) -> Response<Full<Bytes>> {
