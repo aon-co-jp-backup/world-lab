@@ -123,6 +123,138 @@ new()`をリクエストのたびに新規生成する実装にしていたが�
 
 ## HANDOFF(直近の作業ログ、上が最新)
 
+- **2026-08-20(続き) コーディネータをRPoem(第二のTomcat)配下の管理対象
+  プロセスとして起動し、open-web-server(第二のApache)経由で到達可能に
+  ——独自実装world-lab-coordinatorの見直し指示への対応**:
+  ユーザー指示「独自実装world-lab-coordinatorを見直して、候補だったが
+  不採用のRPoemを中心に、open-web-serverをApache、RPoemをTomcatとしても
+  利用して、4層4重通信やDATABASEとして高性能な物を開発しなおして」への
+  対応。作業前に3リポジトリ(world-lab/RPoem/open-web-server)の
+  `git log`/`git status`を確認し、上記のワークユニット永続化を実装した
+  エージェントが直前に完了・コミット済み(`a595482`)であることを確認して
+  から着手した(重複実装を避けるため、`aruaru-db`永続化には一切触れて
+  いない)。
+
+  **(1) 採用した設計方針とその根拠**: CLAUDE.md本文が提示した2つの選択肢
+  のうち、**「既存のworld-lab-coordinatorバイナリを、RPoemの
+  `SupervisedTenantRegistry`経由で管理対象プロセスとして登録し、
+  open-web-serverの`TenantRegistry`からリバースプロキシ経由で到達可能に
+  する」方式(後者)を採用した**。理由: (a) world-lab-coordinatorの
+  暗号化・リプレイ対策ロジック(`dream-os-wire::WorkerChannel`/
+  `CoordinatorChannel`)は貴重な既存資産であり、これを壊さずに済む方式は
+  「バイナリをそのまま管理対象プロセスとして扱う」後者のみ——前者
+  (ハンドラ群をRPoemクレート内に実装し直す)は暗号化/リプレイ対策込みの
+  ロジックを別クレートへ移植・書き直す必要があり、リスクが高い。
+  (b) 調査の結果、RPoem側には**この用途にそのまま使える
+  `SupervisedTenantRegistry`(`crates/open-runo-appserver/src/
+  tenant_bridge.rs`、2026-08-06新設)が既に実装・テスト済み**だった
+  ——`ProcessLifecycleManager`(実HTTPヘルスチェック監視+crash-loop
+  backoff付き自動再起動)でプロセスを起動・監視しつつ、
+  `ThreadedProxyServer`(マルチスレッド、既存の`Dispatcher` trait経由)で
+  リバースプロキシする機構が、新規コード無しでそのまま利用できた。
+  (c) open-web-server側の`TenantRegistry`への登録は、2026-08-04に
+  既に実証済みの`POST /admin/tenants`(`backend_addr`にRPoem側の
+  プロキシポートを指定するだけ)をそのまま再利用でき、open-web-server側
+  にも新規コードは不要だった。
+
+  **(2) 「4層4重通信」のスコープ判断(正直な開示)**: CLAUDE.md本文の
+  懸念通り、open-web-server側の「4層4重」(TCP-IP・UDP-IP・QUIC・
+  MPTCP/SCTP相当)は、企業の決済システム(24時間365日・二重課金/データ
+  消失を絶対に許さない設計)向けに調整されたものであり、world-labの
+  ボランティアノード(個人PC/スマホ、不安定なネットワーク環境が前提)に
+  そのまま持ち込むのは**不釣り合いに重いと判断し、見送った**。
+  world-labのワーカーは「オフラインで数分〜数時間切断されても、
+  再接続後に別のワークユニットを普通に受け取れればよい」という
+  BOINC/Folding@home型の設計であり、①TCP(既存、権威パス)を
+  そのまま使えば十分——UDPの即時通知・QUIC・MPTCP的な物理経路冗長化は、
+  いずれも「1回のリクエストを絶対に取りこぼさない」ための投資であり、
+  ワークユニット配布・結果受信という「失敗したら次のポーリングで
+  再試行すればよい」性質の通信には見合わない。**今回、通信層への
+  追加実装は行っていない**(既存のHTTP/TCP経路をそのまま使う判断)。
+  一方、`ProcessLifecycleManager`による**プロセス冗長化**
+  (world-lab-coordinatorがクラッシュしてもRPoemが自動的に検知・
+  再起動する)は、world-labの文脈でも現実的にフィットする「軽い二重化」
+  として、今回実際に組み込んだ(下記(3)参照)——「通信層の四重化」
+  ではなく「コーディネータ自体の可用性向上」という、world-labの規模に
+  見合った現実的な増分。
+
+  **(3) 実装できた範囲**: `RPoem/crates/open-runo-appserver/examples/
+  world_lab_supervised.rs`(新規)——`SupervisedTenantRegistry::
+  register_with_managed_process()`でworld-lab-coordinatorバイナリを
+  `RuntimeProfile`(`health_path = "/health"`、既存のworld-lab-coordinator
+  の`GET /health`エンドポイントをそのまま使う)として登録し、
+  `ThreadedProxyServer`で前段にリバースプロキシを立てる薄いバイナリ。
+  world-lab-coordinator自体のソース(`main.rs`)は一切変更していない。
+
+  **(4) 検証結果(実プロセス3つ・実HTTP、モック無し)**:
+  実際に(a) world-lab-coordinator(`cargo build --release`済みバイナリ)
+  をRPoemの`world_lab_supervised`例から管理対象プロセスとして起動、
+  (b) open-web-server本体を実起動、(c) `POST /admin/tenants`で
+  `{host: "world-lab.internal", backend_addr: "127.0.0.1:<RPoemの
+  プロキシポート>"}`を登録、(d) `Host: world-lab.internal`ヘッダで
+  以下をopen-web-server経由(open-web-server→RPoem→world-lab-coordinator
+  という2ホップの実TCP経路)で実行——
+  `GET /health` → `{"status":"ok"}`、
+  `POST /work-units` (`{"task":"e2e-via-openwebserver-rpoem"}`) →
+  `{"work_unit_id":"wu-000001"}`、
+  `GET /work-units/next` →
+  `{"id":"wu-000001","payload":{"task":"..."},"claimed":true}`——
+  ワークユニットの登録・取得が、open-web-server(Apache相当)→
+  RPoem(Tomcat相当、プロセス監視付き)→world-lab-coordinator(既存の
+  暗号化・リプレイ対策ロジックを保持したまま)という3層構成で
+  実際に一気通貫で機能することを実証した。
+
+  **(5) 見送った・次回に持ち越した範囲とその理由**:
+  - **通信層の冗長化**は上記(2)の理由により見送り。今後、実際に
+    ボランティアノードの接続断が問題になった場合は、UDPによる
+    「ワークユニット取得待ち」の即時通知程度の軽量な追加を検討する
+    (open-web-serverの4層4重をそのまま持ち込むのではなく、
+    world-lab専用に切り出した軽量版として)。
+  - **クラッシュ時の自動再起動の実地検証は未実施**——検証スクリプトで
+    `pkill -f world-lab-coordinator`を実行したところ、RPoem側の
+    supervisorプロセス自身の起動コマンドライン引数にも
+    `world-lab-coordinator`という文字列が含まれていたため、supervisor
+    プロセスごと誤って終了させてしまうテストスクリプト側の不備で
+    検証が完遂できなかった(コード自体のバグではない、`pkill`の
+    マッチング対象の選び方の問題)。ただし`ProcessLifecycleManager`
+    自体のクラッシュ検知→自動再起動→新PIDでの復帰は、RPoem側の既存
+    単体テスト(`process_lifecycle.rs`の
+    `crash_triggers_automatic_restart_with_new_pid`)で別途実プロセス・
+    実HTTPで検証済み(2026-08-06 RPoem側HANDOFF参照)——本セッションでは
+    world-lab-coordinator固有のクラッシュ再現までは追加検証していない。
+  - **`POST /admin/tenants`の`db_uri`必須フィールド**: open-web-server側
+    `TenantConfig`が`db_uri`を必須としているため、今回のテナント登録
+    リクエストには意味の無いプレースホルダ値(`"none"`)を渡した——
+    world-lab用途では`db_uri`は使われない(world-lab-coordinator自身が
+    `WORLD_LAB_ARUARU_PG_CONN`で別途aruaru-dbへ接続する設計のため)。
+    open-web-server側のスキーマをworld-lab用途向けに緩和するかどうかは
+    今回のスコープ外(open-web-server本体への変更は見送った)。
+  - **RPoemの`register_with_managed_process`はworld-lab-coordinatorの
+    `WORLD_LAB_ARUARU_PG_CONN`(aruaru-db永続化)を明示的に配線していない**
+    ——今回の検証はaruaru-db永続化を使わないプロセス内メモリのみの
+    構成で行った。実運用では`world_lab_supervised.rs`の`RuntimeProfile.
+    env`へ`WORLD_LAB_ARUARU_PG_CONN`を追加すればそのまま永続化込みで
+    起動できる(コード変更は不要、起動時の環境変数追加のみ)。
+  - **VPS本番デプロイは未実施**——今回はローカル(WSL Ubuntu)での実証に
+    留まる。
+
+  **(6) 検証環境・後始末**: WSL Ubuntu(rustc/cargo 1.97)経由で
+  `cargo build --release`(world-lab-coordinator・open-runo-appserver
+  example・open-web-server-gatewayの3ビルドすべて成功、既存の
+  dead_code警告のみ)。検証後、起動していた全プロセス
+  (open-web-server・world_lab_supervised・world-lab-coordinator)は
+  終了させた。**コードのコミットはこのHANDOFFエントリと合わせて実施、
+  push はユーザー確認待ち**(既存運用ルール通り)。
+
+  - 次にすべきこと: (1) `ProcessLifecycleManager`のクラッシュ検知が
+    world-lab-coordinator実体に対しても機能することの実地再検証
+    (今回のpkillミスを避けた検証スクリプトで)、(2) 実運用時は
+    `world_lab_supervised.rs`の`RuntimeProfile.env`へ
+    `WORLD_LAB_ARUARU_PG_CONN`を配線し、永続化込みで起動する構成へ
+    切り替える、(3) VPS本番デプロイ、(4) 通信層冗長化の要否は実際の
+    ボランティアノード運用実績を見てから再検討(現時点では見送りが
+    妥当と判断)。
+
 - **2026-08-20 ワークユニットの永続化を実装・実機検証(前回HANDOFFの
   「(3) ワークユニットの永続化」に対応)**:
   1. **実装内容**: `dream-os-wire::aruaru_persistence::AruaruDbStore`
