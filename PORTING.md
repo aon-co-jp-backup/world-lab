@@ -1,23 +1,35 @@
 # PORTING.md — world-lab お引越しファイル / Porting notes
 
 > 対象バージョン: 構想段階(2026-08-06、`dream-os`から分離直後、
-> コーディネータ実装は未着手)。 / Target version: concept stage
-> (2026-08-06, just split off from `dream-os`, coordinator not yet
-> implemented).
+> コーディネータ本体(`world-lab-coordinator`)を実装・実機検証済み)。
+> / Target version: concept stage (2026-08-06, just split off from
+> `dream-os`; the coordinator itself (`world-lab-coordinator`) has been
+> implemented and verified on real hardware).
 
 ## 0. このリポジトリのスコープ / Scope of this repository
 
 日本語: `world-lab`はBOINC/Folding@home型のボランティア分散
 コンピューティング構想のリポジトリです。実行基盤(`dream-os-kernel`)・
 通信/永続化層(`dream-os-wire`)は`dream-os`側に実装済みで、
-`world-lab`はそれらを利用するコーディネータ層(未実装)を担う想定です。
+`world-lab`はそれらを利用するコーディネータ層を担います。コーディネータ
+本体(`crates/world-lab-coordinator`、Rust+tokio/hyper直接実装)は
+実装済みで、実プロセス・実HTTP・実AEAD暗号処理による実機検証(正常な
+結果送信・リプレイ攻撃の拒否)も完了しています。N-of-M多数決検証・
+ワークユニットの永続化・ワーカーごとの鍵配布は未実装です(詳細は
+`CLAUDE.md`のHANDOFF参照)。
 
 English: `world-lab` is a concept-stage repository for a BOINC/
 Folding@home-style volunteer distributed computing effort. The
 execution backend (`dream-os-kernel`) and communication/persistence
-layer (`dream-os-wire`) already live in `dream-os`; `world-lab` is
-meant to hold the (not yet implemented) coordinator layer that uses
-them.
+layer (`dream-os-wire`) already live in `dream-os`; `world-lab` hosts
+the coordinator layer that uses them. The coordinator itself
+(`crates/world-lab-coordinator`, implemented directly with Rust +
+tokio/hyper) has been implemented and verified end-to-end with real
+processes, real HTTP, and real AEAD cryptography (normal result
+submission and replay-attack rejection). N-of-M majority-vote
+verification, work-unit persistence, and per-worker key distribution
+are not yet implemented (see the HANDOFF section of `CLAUDE.md` for
+details).
 
 ## 1. 持っていくもの(ファイル一覧) / Files to bring along
 
