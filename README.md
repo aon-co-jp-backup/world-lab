@@ -1,3 +1,5 @@
+> Latest translations / 翻訳の最新版: [0-LATEST-TRANSLATIONS.md](0-LATEST-TRANSLATIONS.md)
+
 # World Laboratory (world-lab)
 
 **構想段階のプロジェクトです。** 世界中の個人が持つPC・タブレット・
